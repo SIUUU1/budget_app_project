@@ -1,0 +1,73 @@
+# ---------------------------------------------------------------------------
+# budget_app — .gitignore
+# ---------------------------------------------------------------------------
+
+# 이 프로젝트가 실행 중 만들어내는 산출물 (코드가 아니므로 커밋하지 않음)
+data/              # 기본 저장 폴더 (transactions/categories/budgets/recurring.jsonl, app.log)
+demo_data/         # demo.sh 가 사용하는 시연용 저장 폴더
+demo_data_other/   # demo.sh 의 --data-dir 분리 시연용 폴더
+backups/           # 백업 파일 폴더
+*.jsonl            # JSONL 저장 파일
+*.bak              # backup 명령이 만든 타임스탬프 사본
+*.log              # 실행 로그(app.log 등)
+.tmp_*             # 원자적 교체(os.replace) 도중 남은 임시 파일
+export*.csv        # export 결과
+import*.csv        # import 시연용 입력
+demo_*.csv         # demo.sh 가 만드는 CSV
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# 가상환경
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# 테스트 / 정적 분석 캐시
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# 에디터 / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
