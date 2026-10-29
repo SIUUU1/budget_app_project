@@ -56,10 +56,10 @@ python -m budget_app recurring --help
 
 | 파일 | 내용 | 한 줄 예시 |
 | --- | --- | --- |
-| `transactions.jsonl` | 거래 내역 | `{"id":"TX-000001","type":"expense","date":"2024-01-15","amount":15000,"category":"food","memo":"점심","tags":["meal"]}` |
-| `categories.jsonl` | 카테고리 | `{"name":"food"}` |
+| `transactions.jsonl` | 거래 내역 | `{"id":"TX-000001","type":"expense","date":"2024-01-15","amount":15000,"category_id":"CAT-000001","memo":"점심","tags":["meal"]}` |
+| `categories.jsonl` | 카테고리 | `{"id":"CAT-000001","name":"food"}` |
 | `budgets.jsonl` | 월 예산 | `{"month":"2024-01","amount":500000}` |
-| `recurring.jsonl` | 반복 내역 규칙 **[보너스]** | `{"id":"R-000001","type":"income","day":25,"category":"salary","amount":3000000,"memo":"월급","tags":[],"applied":["2024-03"]}` |
+| `recurring.jsonl` | 반복 내역 규칙 **[보너스]** | `{"id":"R-000001","type":"income","day":25,"category_id":"CAT-000004","amount":3000000,"memo":"월급","tags":[],"applied":["2024-03"]}` |
 
 그 외:
 - `data/backups/` : `backup` 명령으로 만든 타임스탬프 백업 파일 폴더 **[보너스]**
@@ -71,6 +71,9 @@ python -m budget_app recurring --help
   **기본 카테고리를 자동 생성**합니다: `food, transport, rent, salary, etc`
 - `update` / `delete` / 카테고리 대체는 **임시 파일에 쓰고 `os.replace` 로 원자적 교체**하여
   중간에 실패해도 원본 파일이 깨지지 않도록 처리합니다.
+- **예전 형식 자동 변환**: 카테고리를 이름으로 저장했던 파일(`"category":"food"`)을 발견하면
+  첫 실행 때 `category_id` 기준으로 한 번 바꾸고 `[안내]` 를 출력합니다.
+  (각 파일의 **첫 줄만** 확인하므로 평소에는 비용이 거의 없습니다)
 
 ---
 
@@ -81,7 +84,8 @@ python -m budget_app recurring --help
 ```text
            ┌──────────────────────┐
            │       CATEGORY       │
-           │  name (PK)           │
+           │  id (PK)             │
+           │  name (UK)           │
            └──────────┬───────────┘
                       │ 1
           ┌───────────┴────────────┐
@@ -91,8 +95,8 @@ python -m budget_app recurring --help
 │  id (PK)           │ N │  id (PK)                  │
 │  type              │◀──┤  type                     │
 │  date              │ 1 │  day (1~31)               │
-│  amount            │   │  category (FK)            │
-│  category (FK)     │   │  amount                   │
+│  amount            │   │  category_id (FK)         │
+│  category_id (FK)  │   │  amount                   │
 │  memo              │   │  memo / tags              │
 │  tags              │   │  applied [YYYY-MM, ...]   │
 └─────────┬──────────┘   └───────────────────────────┘
@@ -110,8 +114,8 @@ python -m budget_app recurring --help
 
 | 관계 | 의미 | 비고 |
 | --- | --- | --- |
-| `CATEGORY (1) ─ (N) TRANSACTION` | 거래는 반드시 **등록된 카테고리** 하나를 가진다 | `add`/`update`/`import` 시 `cat_store.exists()` 검사. 사용 중인 카테고리는 삭제를 막고 `--replace-with` 로만 정리 |
-| `CATEGORY (1) ─ (N) RECURRING_RULE` | 반복 규칙도 등록된 카테고리를 가리킨다 | 등록 시 검사. 나중에 카테고리가 사라지면 `apply` 가 그 규칙을 **건너뛰고 안내**(적용 표시하지 않음) |
+| `CATEGORY (1) ─ (N) TRANSACTION` | 거래는 반드시 **등록된 카테고리** 하나를 `category_id` 로 가리킨다 | `add`/`update`/`import` 시 `require_category()` 로 검사. 사용 중인 카테고리는 삭제를 막고 `--replace-with` 로만 정리(이때 거래의 `category_id` 를 대체 카테고리 id 로 바꿔 다시 씀) |
+| `CATEGORY (1) ─ (N) RECURRING_RULE` | 반복 규칙도 등록된 카테고리를 `category_id` 로 가리킨다 | 등록 시 검사. 나중에 카테고리가 사라지면 `apply` 가 그 규칙을 **건너뛰고 안내**(적용 표시하지 않음), `recurring list` 는 `CAT-000003(삭제됨)` 으로 보여 줌 |
 | `RECURRING_RULE (1) ─ (N) TRANSACTION` | `apply --month` 한 번에 규칙 하나가 거래 한 건을 낳는다 | 생성된 거래는 일반 거래와 동일. 규칙의 `applied` 에 그 월을 기록해 **재실행해도 중복 생성 안 함** |
 | `BUDGET (1) ─ (N) TRANSACTION` | 예산과 거래는 `month` ↔ `date[:7]` 로 느슨하게 연결된다 | `summary` 가 그 달 지출 합계와 예산을 비교해 사용률·초과 경고를 계산 |
 
@@ -119,14 +123,24 @@ python -m budget_app recurring --help
 
 - `TRANSACTION.id` : `TX-` + 6자리 (`TX-000001`). 기존 파일에서 최대 번호를 스캔해 +1.
 - `RECURRING_RULE.id` : `R-` + 6자리 (`R-000001`). 같은 방식.
-- `CATEGORY.name`, `BUDGET.month` 는 값 자체가 키이므로 중복 등록을 막습니다.
+- `CATEGORY.id` : `CAT-` + 6자리 (`CAT-000001`). 같은 방식이며 **PK 는 이 `id` 하나뿐**입니다.
+- `CATEGORY.name` 은 PK 가 아니지만 사람이 직접 입력하는 이름이라 **중복 등록을 막습니다**(유일 값, UK).
+- `BUDGET.month` 는 값 자체가 키이므로 중복 등록을 막습니다.
+
+**외래키(FK)** : `TRANSACTION.category_id` / `RECURRING_RULE.category_id` 는 `CATEGORY.id` 를 가리킵니다.
+이름이 아니라 id 로 가리키므로 **카테고리 이름이 바뀌어도 거래를 고칠 필요가 없습니다.**
+
+- 명령에서는 `--category food` 처럼 **이름**으로 쓰고, `--category CAT-000001` 처럼 **id** 로도 쓸 수 있습니다
+  (`BudgetService.find_category()` 가 id -> 이름 순으로 찾습니다).
+- 화면과 CSV 에는 다시 **이름**으로 보여 줍니다(`category_names()` 로 `{id: 이름}` 을 한 번만 만들어 사용).
+- 등록되지 않은 카테고리로 `search` 하면 오류 대신 결과 없음으로 처리합니다.
 
 ### 모델 ↔ 코드 대응
 
 | 엔터티 | dataclass ([models.py](budget_app/models.py)) | 저장소 ([repository.py](budget_app/repository.py)) | 파일 |
 | --- | --- | --- | --- |
 | TRANSACTION | `Transaction` | `TransactionRepository` | `transactions.jsonl` |
-| CATEGORY | (문자열) | `CategoryStore` | `categories.jsonl` |
+| CATEGORY | `Category` | `CategoryStore` | `categories.jsonl` |
 | BUDGET | `Budget` (구조 정의용, 저장소는 `month → amount` dict 로 다룸) | `BudgetStore` | `budgets.jsonl` |
 | RECURRING_RULE | `RecurringRule` | `RecurringStore` | `recurring.jsonl` |
 
@@ -196,6 +210,7 @@ python -m budget_app update --id TX-000001 --amount 18000 --memo 수정
 python -m budget_app delete --id TX-000001
 ```
 
+`category list` 는 `- CAT-000001 | food` 처럼 **PK(`id`)와 이름을 함께** 보여 줍니다.
 카테고리 삭제 시 그 카테고리를 쓰는 거래가 있으면 **삭제를 막고, `--replace-with` 로 대체**를 요구합니다.
 
 ### import / export — CSV
@@ -256,7 +271,7 @@ $ python -m budget_app backup
 | --- | --- | --- |
 | `date` | Y | `YYYY-MM-DD` |
 | `type` | Y | `income` / `expense` |
-| `category` | Y | 등록된 카테고리 |
+| `category` | Y | 등록된 카테고리 **이름**(또는 id). 저장할 때 `category_id` 로 변환되고, export 시 다시 이름으로 적습니다 |
 | `amount` | Y | 양수 정수 |
 | `memo` | N | 문자열 |
 | `tags` | N | 쉼표(`,`) 구분 문자열 |

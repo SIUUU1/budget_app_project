@@ -57,7 +57,16 @@ def build_service(data_dir: str) -> BudgetService:
     # 처음 실행이면 기본 카테고리를 넣어 준다.
     # (카테고리가 하나도 없으면 거래를 아예 추가할 수 없기 때문)
     cat_store.ensure_defaults()
-    return BudgetService(tx_repo, cat_store, budget_store, recurring_store)
+    service = BudgetService(tx_repo, cat_store, budget_store, recurring_store)
+    # 카테고리를 이름으로 저장하던 예전 파일이면 id(FK) 기준으로 한 번 바꿔 준다.
+    # (각 파일의 첫 줄만 확인하므로 평소에는 거의 비용이 없다)
+    moved_tx, moved_rules = service.migrate_category_fk()
+    if moved_tx or moved_rules:
+        print(
+            f"[안내] 예전 저장 형식을 category_id 기준으로 변환했습니다 "
+            f"(거래 {moved_tx}건, 반복 규칙 {moved_rules}건)"
+        )
+    return service
 
 
 # --------------------------------------------------------------------------- #
@@ -94,8 +103,11 @@ def _prompt_valid(label: str, validator: Callable[[str], object]) -> object:
 # --------------------------------------------------------------------------- #
 # 출력 포맷 (보너스: 외부 라이브러리 없이 컬럼 정렬)
 # --------------------------------------------------------------------------- #
-def _print_tx_table(txs: list) -> None:
+def _print_tx_table(txs: list, category_names: dict) -> None:
     """거래 목록을 칸이 맞는 표로 출력한다.
+
+    거래에는 카테고리 id(FK)만 들어 있으므로, ``category_names``
+    ({id: 이름} 사전)로 사람이 읽을 이름을 찾아 출력한다.
 
     ★ 출력 원리
       그냥 출력하면 글자 수가 달라 칸이 들쭉날쭉해진다.
@@ -113,7 +125,16 @@ def _print_tx_table(txs: list) -> None:
         return
     # 모든 값을 문자열로 바꿔 둔다 (길이를 재고 붙이려면 문자열이어야 한다).
     rows = [
-        [t.id, t.date, t.type, t.category, str(t.amount), t.memo or ""] for t in txs
+        [
+            t.id,
+            t.date,
+            t.type,
+            # 카테고리가 지워졌다면 id 를 그대로 보여 주어 이상을 알 수 있게 한다.
+            category_names.get(t.category_id, t.category_id),
+            str(t.amount),
+            t.memo or "",
+        ]
+        for t in txs
     ]
     # 각 열(i번째 칸)에서 가장 긴 글자 수를 구한다.
     # 메모(5번 칸)는 길이를 재지 않는다. 맨 끝이라 맞출 필요가 없다.
@@ -151,10 +172,11 @@ def cmd_add(service: BudgetService, args: argparse.Namespace) -> None:
     # 카테고리 '기존에 등록되어 있는지' 확인 필요.
     while True:
         category = _prompt("카테고리: ")
-        if service.cat_store.exists(category):
+        # 이름(food) 과 id(CAT-000001) 를 모두 받아 준다.
+        if service.find_category(category) is not None:
             break
         print(f"[오류] 등록되지 않은 카테고리입니다: {category!r}")
-        print(f"등록된 카테고리: {', '.join(service.list_categories())}")
+        print(f"등록된 카테고리: {', '.join(service.cat_store.list())}")
         print("       'category add' 로 새 카테고리를 먼저 등록할 수 있습니다.")
     amount = _prompt_valid("금액(양수): ", validate_amount)
     memo = _prompt("메모(선택): ")
@@ -172,7 +194,7 @@ def cmd_list(service: BudgetService, args: argparse.Namespace) -> None:
     list(...) 로 감싸는 이유: list_recent 는 제너레이터라 값을 하나씩만 준다.
     표를 그리려면 열 너비를 재야 하고, 그러려면 전체가 필요해서 여기서 리스트로 만든다.
     """
-    _print_tx_table(list(service.list_recent(args.limit)))
+    _print_tx_table(list(service.list_recent(args.limit)), service.category_names())
 
 
 @logged
@@ -186,7 +208,7 @@ def cmd_search(service: BudgetService, args: argparse.Namespace) -> None:
         q=args.q,
         tag=args.tag,
     )
-    _print_tx_table(results)
+    _print_tx_table(results, service.category_names())
 
 
 @logged
@@ -245,13 +267,14 @@ def cmd_category(service: BudgetService, args: argparse.Namespace) -> None:
         # --name이 없으면 물어본다.
         name = args.name if args.name else _prompt("카테고리명: ")
         saved = service.add_category(name)
-        print(f"[저장 완료] category={saved}")
+        print(f"[저장 완료] id={saved.id} category={saved.name}")
     elif args.action == "list":
         cats = service.list_categories()
         if not cats:
             print("(카테고리 없음)")
         for c in cats:
-            print(f"- {c}")
+            # id 가 PK 이므로 이름과 함께 보여 준다.
+            print(f"- {c.id} | {c.name}")
     else:  # remove
         if not args.name:
             raise ValidationError(
@@ -339,10 +362,10 @@ def cmd_recurring(service: BudgetService, args: argparse.Namespace) -> None:
             type_ = args.type
             day = args.day
             category = args.category.strip()
-            if not service.cat_store.exists(category):
+            if service.find_category(category) is None:
                 raise CategoryError(
                     f"등록되지 않은 카테고리입니다: {category!r}",
-                    f"등록된 카테고리: {', '.join(service.list_categories())}",
+                    f"등록된 카테고리: {', '.join(service.cat_store.list())}",
                 )
             amount = args.amount
             # or "" : 옵션을 안 주면 None 인데, 뒤에서 .split() 을 하려면 문자열이어야 한다.
@@ -354,10 +377,10 @@ def cmd_recurring(service: BudgetService, args: argparse.Namespace) -> None:
             day = _prompt_valid("반복일(1~31): ", validate_day)
             while True:
                 category = _prompt("카테고리: ")
-                if service.cat_store.exists(category):
+                if service.find_category(category) is not None:
                     break
                 print(f"[오류] 등록되지 않은 카테고리입니다: {category!r}")
-                print(f"등록된 카테고리: {', '.join(service.list_categories())}")
+                print(f"등록된 카테고리: {', '.join(service.cat_store.list())}")
             amount = _prompt_valid("금액(양수): ", validate_amount)
             memo = _prompt("메모(선택): ")
             tags_raw = _prompt("태그(쉼표로 구분, 없으면 엔터): ")
@@ -366,19 +389,23 @@ def cmd_recurring(service: BudgetService, args: argparse.Namespace) -> None:
         rule = service.add_recurring(type_, day, category, amount, memo, tags)
         print(
             f"[저장 완료] id={rule.id} "
-            f"(매월 {rule.day}일 · {rule.type} · {rule.amount}원 · {rule.category})"
+            f"(매월 {rule.day}일 · {rule.type} · {rule.amount}원 · "
+            f"{service.category_label(rule.category_id)})"
         )
     elif args.action == "list":
         rules = service.list_recurring()
         if not rules:
             print("(반복 내역 없음)")
             return
+        names = service.category_names()
         for r in rules:
             # 적용한 달이 있을 때만 그 부분을 덧붙인다(없으면 빈 문자열 = 아무것도 안 붙음).
             applied = f" · 적용월: {', '.join(r.applied)}" if r.applied else ""
+            # 카테고리가 지워진 규칙은 apply 가 건너뛰므로 그 사실을 함께 보여 준다.
+            category = names.get(r.category_id, f"{r.category_id}(삭제됨)")
             print(
                 # {r.day:>2} 는 두 칸 폭으로 오른쪽 정렬. 5일과 25일의 줄을 맞춰 준다.
-                f"{r.id} | 매월 {r.day:>2}일 | {r.type} | {r.category} | "
+                f"{r.id} | 매월 {r.day:>2}일 | {r.type} | {category} | "
                 f"{r.amount}원 | {r.memo}{applied}"
             )
     elif args.action == "remove":
@@ -395,8 +422,10 @@ def cmd_recurring(service: BudgetService, args: argparse.Namespace) -> None:
             )
         generated, skipped = service.apply_recurring(args.month)
         print(f"[생성 완료] {args.month} 반복 내역 {len(generated)}건 생성")
+        names = service.category_names()
         for tx in generated:
-            print(f"- {tx.id} {tx.date} {tx.type} {tx.category} {tx.amount}원")
+            category = names.get(tx.category_id, tx.category_id)
+            print(f"- {tx.id} {tx.date} {tx.type} {category} {tx.amount}원")
         if skipped:
             print(f"[안내] 카테고리가 없어 건너뛴 규칙 {skipped}건 (카테고리 등록 후 다시 apply)")
 

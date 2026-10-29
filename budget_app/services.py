@@ -12,6 +12,7 @@ from typing import Iterator, Optional
 
 from .errors import CategoryError, NotFoundError, ValidationError
 from .models import (
+    Category,
     RecurringRule,
     Transaction,
     validate_amount,
@@ -47,6 +48,36 @@ class BudgetService:
         self.budget_store = budget_store
         self.recurring_store = recurring_store
 
+    # ------------------- 카테고리 조회 (FK 변환) ------------------------- #
+    # 사람은 'food' 라는 이름으로 말하지만 파일에는 'CAT-000001' 이라는 id 가 들어간다.
+    # 그 사이를 바꿔 주는 함수들을 한곳에 모아 둔다.
+    def find_category(self, value: str) -> Optional[Category]:
+        """id 또는 이름으로 카테고리를 찾는다. 없으면 None."""
+        return self.cat_store.find(value)
+
+    def require_category(self, value: str) -> Category:
+        """카테고리를 찾아 돌려주고, 없으면 CategoryError 를 낸다."""
+        category = self.find_category(value)
+        if category is None:
+            raise CategoryError(
+                f"등록되지 않은 카테고리입니다: {(value or '').strip()!r}",
+                "'category add' 로 등록하거나 기존 카테고리를 사용하세요. "
+                f"현재: {', '.join(self.cat_store.list()) or '(없음)'}",
+            )
+        return category
+
+    def category_names(self) -> dict[str, str]:
+        """{id: 이름} 사전을 만든다. 목록·요약 출력에서 이름을 찾을 때 쓴다.
+
+        거래마다 파일을 다시 읽지 않도록, 한 번 만들어 두고 돌려 쓴다.
+        """
+        return {c.id: c.name for c in self.cat_store.list_all()}
+
+    def category_label(self, category_id: str) -> str:
+        """화면에 보여 줄 카테고리 이름. 삭제된 카테고리면 그 사실을 알려 준다."""
+        category = self.cat_store.get(category_id)
+        return category.name if category else f"{category_id}(삭제됨)"
+
     # ----------------------------- add ----------------------------------- #
     def add_transaction(
         self,
@@ -58,25 +89,24 @@ class BudgetService:
         tags: Optional[list[str]] = None,
     ) -> Transaction:
         """거래 한 건을 검증한 뒤 저장한다.
+
+        ``category`` 는 사람이 쓰는 이름(``food``)이나 id(``CAT-000001``) 둘 다 받으며,
+        저장할 때는 카테고리의 PK(``category_id``)로 바꿔서 넣는다.
         """
         # 1) 형식 검증 — 통과하면 다듬어진 값이 돌아오고, 틀리면 여기서 예외가 나며 멈춘다.
         type_ = validate_type(type_)
         date = validate_date(date)
         amount_int = validate_amount(amount)
-        category = (category or "").strip()
-        if not self.cat_store.exists(category):
-            raise CategoryError(
-                f"등록되지 않은 카테고리입니다: {category!r}",
-                "'category add' 로 등록하거나 기존 카테고리를 사용하세요. "
-                f"현재: {', '.join(self.cat_store.list()) or '(없음)'}",
-            )
+        # 이름(또는 id)을 실제 카테고리로 바꾼다. 없으면 여기서 멈춘다.
+        category_obj = self.require_category(category)
         # 2) 객체 생성 
         tx = Transaction(
             id=self.tx_repo.next_id(),
             type=type_,
             date=date,
             amount=amount_int,
-            category=category,
+            # 저장되는 값은 이름이 아니라 카테고리의 PK 다.
+            category_id=category_obj.id,
             memo=memo or "",
             tags=tags or [],
         )
@@ -113,6 +143,14 @@ class BudgetService:
             date_from = validate_date(date_from)
         if date_to is not None:
             date_to = validate_date(date_to)
+        # 카테고리 조건은 이름으로 들어오므로 먼저 id 로 바꿔 둔다.
+        category_id: Optional[str] = None
+        if category is not None:
+            found = self.find_category(category)
+            if found is None:
+                # 등록된 적 없는 카테고리라면 맞는 거래도 없다.
+                return []
+            category_id = found.id
 
         def matches(tx: Transaction) -> bool:
             """거래 하나가 모든 조건을 만족하는지 검사한다.
@@ -125,7 +163,7 @@ class BudgetService:
                 return False
             if date_to and tx.date > date_to:
                 return False
-            if category and tx.category != category:
+            if category_id and tx.category_id != category_id:
                 return False
             if type_ and tx.type != type_:
                 return False
@@ -148,7 +186,7 @@ class BudgetService:
         month = validate_month(month)
         total_income = 0
         total_expense = 0
-        by_category: dict[str, int] = {}  # 카테고리별 지출 합계
+        by_category: dict[str, int] = {}  # 카테고리 id 별 지출 합계
         found = False  # 해당 달에 거래 유무
 
         for tx in self.tx_repo.iter_all():
@@ -160,11 +198,19 @@ class BudgetService:
                 total_income += tx.amount
             else:
                 total_expense += tx.amount
-                by_category[tx.category] = by_category.get(tx.category, 0) + tx.amount
+                by_category[tx.category_id] = (
+                    by_category.get(tx.category_id, 0) + tx.amount
+                )
 
         # 카테고리별 합계를 금액 큰 순으로 정렬해 앞에서 top 개만 자른다.
-        # kv 는 ("food", 45000) 같은 묶음이고 kv[1] 은 금액이다.
-        top_list = sorted(by_category.items(), key=lambda kv: kv[1], reverse=True)[:top]
+        # kv 는 ("CAT-000001", 45000) 같은 묶음이고 kv[1] 은 금액이다.
+        top_pairs = sorted(by_category.items(), key=lambda kv: kv[1], reverse=True)[:top]
+        # 화면에는 id 가 아니라 이름을 보여 준다.
+        names = self.category_names()
+        top_list = [
+            (names.get(category_id, f"{category_id}(삭제됨)"), amount)
+            for category_id, amount in top_pairs
+        ]
         return {
             "month": month,
             "found": found,
@@ -210,13 +256,8 @@ class BudgetService:
                 if amount is not None:
                     tx.amount = validate_amount(amount)
                 if category is not None:
-                    category = category.strip()
-                    if not self.cat_store.exists(category):
-                        raise CategoryError(
-                            f"등록되지 않은 카테고리입니다: {category!r}",
-                            "'category add' 로 먼저 등록하세요.",
-                        )
-                    tx.category = category
+                    # 이름/id 를 확인한 뒤 FK 를 바꿔 끼운다.
+                    tx.category_id = self.require_category(category).id
                 if memo is not None:
                     tx.memo = memo
                 if tags is not None:
@@ -254,19 +295,18 @@ class BudgetService:
         self.tx_repo.rewrite(kept)
 
     # --------------------------- category -------------------------------- #
-    def add_category(self, name: str) -> str:
-        """카테고리를 추가한다."""
+    def add_category(self, name: str) -> Category:
+        """카테고리를 추가하고, 새로 만들어진 카테고리(id 포함)를 돌려준다."""
         name = (name or "").strip()
         if not name:
             raise ValidationError("카테고리명이 비어 있습니다.", "한 글자 이상 입력하세요.")
         if self.cat_store.exists(name):
             raise CategoryError(f"이미 존재하는 카테고리입니다: {name}", "다른 이름을 사용하세요.")
-        self.cat_store.add(name)
-        return name
+        return self.cat_store.add(name)
 
-    def list_categories(self) -> list[str]:
-        """등록된 카테고리 목록."""
-        return self.cat_store.list()
+    def list_categories(self) -> list[Category]:
+        """등록된 카테고리 목록 (id + name)."""
+        return self.cat_store.list_all()
 
     def remove_category(self, name: str, replace_with: Optional[str] = None) -> int:
         """카테고리를 삭제한다. 사용 중이면 막거나 대체 카테고리를 요구한다.
@@ -274,37 +314,44 @@ class BudgetService:
         반환값: 다른 카테고리로 옮겨진 거래 건수.
         """
         name = (name or "").strip()
-        if not self.cat_store.exists(name):
+        target = self.find_category(name)
+        if target is None:
             raise NotFoundError(
                 f"존재하지 않는 카테고리입니다: {name}", "'category list' 로 확인하세요."
             )
-        # 이 카테고리를 쓰는 거래가 몇 건인지 센다.
-        in_use = sum(1 for tx in self.tx_repo.iter_all() if tx.category == name)
+        # 이 카테고리를 쓰는 거래가 몇 건인지 센다. (비교는 이름이 아니라 FK 로 한다)
+        in_use = sum(1 for tx in self.tx_repo.iter_all() if tx.category_id == target.id)
         reassigned = 0
         if in_use:
             if not replace_with:
                 # 대체 카테고리를 안 줬으면 삭제를 거부한다.
                 raise CategoryError(
-                    f"'{name}' 카테고리를 사용하는 거래가 {in_use}건 있어 삭제할 수 없습니다.",
+                    f"'{target.name}' 카테고리를 사용하는 거래가 {in_use}건 있어 삭제할 수 없습니다.",
                     "--replace-with <카테고리> 로 대체 카테고리를 지정하세요.",
                 )
-            replace_with = replace_with.strip()
             # 대체할 카테고리가 등록되어 있는지 확인.
-            if not self.cat_store.exists(replace_with):
+            replacement = self.find_category(replace_with)
+            if replacement is None:
                 raise CategoryError(
-                    f"대체 카테고리가 존재하지 않습니다: {replace_with}",
+                    f"대체 카테고리가 존재하지 않습니다: {replace_with.strip()}",
                     "'category add' 로 먼저 등록하세요.",
                 )
-            # 해당 거래들의 카테고리를 전부 바꿔서 다시 쓴다.
+            if replacement.id == target.id:
+                raise CategoryError(
+                    "삭제할 카테고리와 대체 카테고리가 같습니다.",
+                    "다른 카테고리를 --replace-with 로 지정하세요.",
+                )
+            # 해당 거래들의 FK 를 전부 바꿔서 다시 쓴다.
             updated: list[Transaction] = []
             for tx in self.tx_repo.iter_all():
-                if tx.category == name:
-                    tx.category = replace_with
+                if tx.category_id == target.id:
+                    tx.category_id = replacement.id
                     reassigned += 1
                 updated.append(tx)
             self.tx_repo.rewrite(updated)
         # 거래 정리가 끝난 다음에 카테고리 삭제.
-        remaining = [c for c in self.cat_store.list() if c != name]
+        # (id 는 한 번 준 번호를 다시 쓰지 않으므로, 남은 카테고리의 id 는 그대로 둔다)
+        remaining = [c for c in self.cat_store.list_all() if c.id != target.id]
         self.cat_store.replace_all(remaining)
         return reassigned
 
@@ -320,12 +367,16 @@ class BudgetService:
     def import_csv(self, csv_path: str) -> tuple[int, int]:
         """CSV 파일을 읽어 거래로 추가한다.
 
+        CSV 의 ``category`` 열은 카테고리 **이름**이며, 저장할 때 id 로 바꾼다.
+        등록되지 않은 이름이면 그 줄만 건너뛴다.
+
         반환값: (성공 건수, 건너뛴 건수)
         """
         if not os.path.exists(csv_path):
             raise NotFoundError(f"파일을 찾을 수 없습니다: {csv_path}", "경로를 확인하세요.")
         imported = 0
         skipped = 0
+        # CSV 의 category 열은 사람이 쓰는 이름이다. 이름 -> id 로 바꿔 저장한다.
         # id 번호 조회
         next_num = self.tx_repo.max_id_num() + 1
         buffer: list[Transaction] = []  # 성공한 거래를 모아 뒀다가 마지막에 한 번에 저장
@@ -337,8 +388,8 @@ class BudgetService:
                     type_ = validate_type(row.get("type", ""))
                     date = validate_date(row.get("date", ""))
                     amount = validate_amount(row.get("amount", ""))
-                    category = (row.get("category") or "").strip()
-                    if not self.cat_store.exists(category):
+                    category = self.find_category(row.get("category") or "")
+                    if category is None:
                         raise ValidationError("등록되지 않은 카테고리", "")
                     memo = (row.get("memo") or "").strip()
                     # "meal, fixed" 를 ["meal", "fixed"] 로 변환.
@@ -349,7 +400,7 @@ class BudgetService:
                             type=type_,
                             date=date,
                             amount=amount,
-                            category=category,
+                            category_id=category.id,
                             memo=memo,
                             tags=tags,
                         )
@@ -369,7 +420,10 @@ class BudgetService:
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
     ) -> int:
-        """조건에 맞는 거래를 CSV 파일로 내보낸다. 
+        """조건에 맞는 거래를 CSV 파일로 내보낸다.
+
+        저장 파일에는 ``category_id`` 가 들어 있지만, CSV 에는 다시
+        사람이 읽을 수 있는 카테고리 **이름**으로 적는다.
         반환값: 내보낸 건수.
         """
         # 최소 한 가지 조건은 받도록 했다.
@@ -397,6 +451,8 @@ class BudgetService:
 
         rows = [tx for tx in self.tx_repo.iter_all() if matches(tx)]
         rows.sort(key=lambda t: (t.date, t.id), reverse=True)
+        # CSV 에는 id 대신 사람이 읽을 수 있는 카테고리 이름을 쓴다.
+        names = self.category_names()
 
         with open(out_path, "w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
@@ -404,7 +460,14 @@ class BudgetService:
             for tx in rows:
                 # 태그 리스트는 "meal,fixed" 처럼 한 칸에 합쳐서 넣는다.
                 writer.writerow(
-                    [tx.date, tx.type, tx.category, tx.amount, tx.memo, ",".join(tx.tags)]
+                    [
+                        tx.date,
+                        tx.type,
+                        names.get(tx.category_id, tx.category_id),
+                        tx.amount,
+                        tx.memo,
+                        ",".join(tx.tags),
+                    ]
                 )
         return len(rows)
 
@@ -423,17 +486,12 @@ class BudgetService:
         type_ = validate_type(type_)
         day_int = validate_day(day)
         amount_int = validate_amount(amount)
-        category = (category or "").strip()
-        if not self.cat_store.exists(category):
-            raise CategoryError(
-                f"등록되지 않은 카테고리입니다: {category!r}",
-                f"등록된 카테고리: {', '.join(self.cat_store.list()) or '(없음)'}",
-            )
+        category_obj = self.require_category(category)
         rule = RecurringRule(
             id=self.recurring_store.next_id(),
             type=type_,
             day=day_int,
-            category=category,
+            category_id=category_obj.id,
             amount=amount_int,
             memo=memo or "",
             tags=tags or [],
@@ -479,7 +537,7 @@ class BudgetService:
         for rule in rules:
             if month in rule.applied:
                 continue  # ★ 이미 이 달에 적용했다 -> 중복 생성하지 않는다
-            if not self.cat_store.exists(rule.category):
+            if self.cat_store.get(rule.category_id) is None:
                 # 규칙을 만든 뒤에 그 카테고리가 삭제된 경우다. 건너뛰되 applied 에 적지 않는다.
                 skipped += 1
                 continue
@@ -491,7 +549,7 @@ class BudgetService:
                     type=rule.type,
                     date=f"{month}-{day:02d}",
                     amount=rule.amount,
-                    category=rule.category,
+                    category_id=rule.category_id,
                     memo=rule.memo,
                     # list(...) 로 복사본을 넣는다. 그냥 rule.tags 를 넣으면
                     # 거래와 규칙이 같은 리스트를 공유해, 한쪽을 고치면 다른 쪽도 바뀐다.
@@ -507,6 +565,47 @@ class BudgetService:
             # applied 기록이 바뀌었으므로 반복 내역 파일도 저장해야 한다.
             self.recurring_store.rewrite(rules)
         return generated, skipped
+
+    # --------------- 예전 저장 파일 변환 (category -> category_id) -------- #
+    def migrate_category_fk(self) -> tuple[int, int]:
+        """카테고리를 **이름**으로 저장하던 예전 파일을 **id** 기준으로 바꾼다.
+
+        각 파일의 첫 줄만 확인하므로, 이미 새 형식이면 아무 일도 하지 않는다.
+        이름이 더는 등록되어 있지 않으면 그 이름으로 카테고리를 다시 만들어
+        거래가 가리킬 곳을 잃지 않게 한다.
+
+        반환값: (옮긴 거래 수, 옮긴 반복 규칙 수)
+        """
+        moved_tx = 0
+        moved_rules = 0
+
+        # 이름 -> id 를 찾다가 없으면 만들어서 재사용하기 위한 작은 도우미.
+        def category_id_for(name: str) -> str:
+            name = (name or "").strip()
+            if not name:
+                return name  # 비어 있던 줄은 손대지 않는다
+            category = self.cat_store.find(name)
+            if category is None:
+                category = self.cat_store.add(name)
+            return category.id
+
+        if self.tx_repo.uses_legacy_category_key():
+            migrated: list[Transaction] = []
+            for tx in self.tx_repo.iter_all():
+                # 예전 파일에서는 category_id 자리에 '이름' 이 들어와 있다.
+                tx.category_id = category_id_for(tx.category_id)
+                migrated.append(tx)
+                moved_tx += 1
+            self.tx_repo.rewrite(migrated)
+
+        if self.recurring_store.uses_legacy_category_key():
+            rules = self.recurring_store.list()
+            for rule in rules:
+                rule.category_id = category_id_for(rule.category_id)
+                moved_rules += 1
+            self.recurring_store.rewrite(rules)
+
+        return moved_tx, moved_rules
 
     # ------------------------- 백업 (보너스) ----------------------------- #
     def backup(self) -> list[str]:

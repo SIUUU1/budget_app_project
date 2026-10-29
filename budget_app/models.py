@@ -1,7 +1,7 @@
 """데이터 모델 계층
 
 1. 데이터의 정의 : 거래 한 건은 어떤 항목들로 이루어지는가?
-   -> ``Transaction``, ``Budget``, ``RecurringRule`` 클래스
+   -> ``Transaction``, ``Category``, ``Budget``, ``RecurringRule`` 클래스
 2. 올바른 값의 기준 정의 : 날짜는 어떤 형식이어야 하는가? 금액은?
    -> ``validate_...`` 로 시작하는 검증 함수들
 """
@@ -19,6 +19,17 @@ from .errors import ValidationError
 VALID_TYPES: tuple[str, str] = ("income", "expense")
 
 
+def _read_category_id(data: dict) -> str:
+    """저장된 dict 에서 카테고리 외래키를 꺼낸다.
+
+    지금 형식은 ``{"category_id": "CAT-000001"}`` 이지만,
+    카테고리 이름을 그대로 넣던 예전 파일(``{"category": "food"}``)도
+    읽을 수 있도록 두 가지를 모두 받아 준다. 예전 값(이름)을 실제 id 로
+    바꾸는 일은 ``services.BudgetService.migrate_category_fk()`` 가 처리한다.
+    """
+    return str(data.get("category_id") or data.get("category") or "")
+
+
 @dataclass
 class Transaction:
     """거래 내역 한 건 (수입 또는 지출 하나).
@@ -27,13 +38,17 @@ class Transaction:
 
     필드 설명
     ----
-    id       : 유일 식별자 (예: ``TX-000012``)
-    type     : ``income``(수입) 또는 ``expense``(지출)
-    date     : ``YYYY-MM-DD`` 형식 문자열
-    amount   : 양의 정수(원)
-    category : 등록된 카테고리 이름
-    memo     : 메모(선택) — 안 쓰면 빈 문자열
-    tags     : 태그 목록(선택) — 안 쓰면 빈 리스트
+    id          : 유일 식별자 (예: ``TX-000012``)
+    type        : ``income``(수입) 또는 ``expense``(지출)
+    date        : ``YYYY-MM-DD`` 형식 문자열
+    amount      : 양의 정수(원)
+    category_id : 등록된 카테고리의 **PK**(예: ``CAT-000001``) — 외래키(FK)
+    memo        : 메모(선택) — 안 쓰면 빈 문자열
+    tags        : 태그 목록(선택) — 안 쓰면 빈 리스트
+
+    카테고리를 '이름' 대신 'id' 로 가리키므로, 카테고리 이름을 바꿔도
+    거래를 하나도 고치지 않아도 된다. 사람에게 보여 줄 이름은
+    ``CategoryStore`` 에서 id 로 찾아온다.
     """
 
     # 기본값이 없는 필드 = 만들 때 반드시 넣어야 하는 값
@@ -41,7 +56,7 @@ class Transaction:
     type: str
     date: str
     amount: int
-    category: str
+    category_id: str
     # 기본값이 있는 필드 = 안 넣으면 이 값이 들어감
     memo: str = ""
     # ``tags: list[str] = []`` 라고 쓰면
@@ -61,7 +76,7 @@ class Transaction:
             "type": self.type,
             "date": self.date,
             "amount": self.amount,
-            "category": self.category,
+            "category_id": self.category_id,
             "memo": self.memo,
             "tags": self.tags,
         }
@@ -81,10 +96,33 @@ class Transaction:
             type=str(data["type"]),
             date=str(data["date"]),
             amount=int(data["amount"]),
-            category=str(data["category"]),
+            category_id=_read_category_id(data),
             memo=str(data.get("memo", "") or ""),
             tags=list(data.get("tags", []) or []),
         )
+
+
+@dataclass
+class Category:
+    """카테고리 한 건 (거래를 분류하는 이름표).
+
+    필드 설명
+    ----
+    id   : 유일 식별자 (예: ``CAT-000001``)
+    name : 카테고리 이름 (예: ``food``) — PK 는 아니지만 중복 등록은 막는다(유일 값).
+    """
+
+    id: str
+    name: str
+
+    def to_dict(self) -> dict:
+        """저장을 위해 dict 로 변환."""
+        return {"id": self.id, "name": self.name}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Category":
+        """파일에서 읽은 dict 로 객체 복원."""
+        return cls(id=str(data["id"]), name=str(data["name"]))
 
 
 @dataclass
@@ -104,16 +142,24 @@ class RecurringRule:
 
     ``recurring apply --month 2024-03`` 을 실행하면 이 틀로 실제 거래를 찍어낸다.
 
-    ``day``     : 매월 며칠에 생성할지 (1~31).
+    필드 설명
+    ----
+    id          : 유일 식별자 (예: ``R-000003``) — 거래(``TX-``)와 구분된다.
+    type        : ``income``(수입) 또는 ``expense``(지출)
+    day         : 매월 며칠에 생성할지 (1~31).
                   그 달에 그 날짜가 없으면(예: 2월 31일) 그 달의 마지막 날로 보정한다.
-    ``applied`` : 이미 거래를 만들어 둔 월들의 목록(예: ["2024-02", "2024-03"]).
+    category_id : 등록된 카테고리의 **PK**(예: ``CAT-000001``) — 거래와 마찬가지로 외래키(FK)
+    amount      : 양의 정수(원)
+    memo        : 메모(선택) — 안 쓰면 빈 문자열
+    tags        : 태그 목록(선택) — 안 쓰면 빈 리스트
+    applied     : 이미 거래를 만들어 둔 월들의 목록(예: ["2024-02", "2024-03"]).
                   같은 달에 실수로 두 번 실행해도 중복으로 만들지 않기 위한 기록이다.
     """
 
     id: str
     type: str
     day: int
-    category: str
+    category_id: str
     amount: int
     memo: str = ""
     tags: list[str] = field(default_factory=list)
@@ -125,7 +171,7 @@ class RecurringRule:
             "id": self.id,
             "type": self.type,
             "day": self.day,
-            "category": self.category,
+            "category_id": self.category_id,
             "amount": self.amount,
             "memo": self.memo,
             "tags": self.tags,
@@ -139,7 +185,7 @@ class RecurringRule:
             id=str(data["id"]),
             type=str(data["type"]),
             day=int(data["day"]),
-            category=str(data["category"]),
+            category_id=_read_category_id(data),
             amount=int(data["amount"]),
             memo=str(data.get("memo", "") or ""),
             tags=list(data.get("tags", []) or []),

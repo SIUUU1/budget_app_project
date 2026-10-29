@@ -19,11 +19,12 @@ import re
 import tempfile  # 임시 파일 만들기
 from typing import Iterable, Iterator, Optional
 
-from .models import RecurringRule, Transaction
+from .models import Category, RecurringRule, Transaction
 
 # 정규표현식(regular expression)
 _ID_RE = re.compile(r"TX-(\d+)$")
 _R_ID_RE = re.compile(r"R-(\d+)$")
+_C_ID_RE = re.compile(r"CAT-(\d+)$")
 
 
 # --------------------------------------------------------------------------- #
@@ -85,6 +86,18 @@ def _iter_lines_reversed(
         stripped = buffer.strip()
         if stripped:
             yield stripped.decode(encoding)
+
+
+def _uses_legacy_category_key(path: str) -> bool:
+    """파일의 **첫 줄만** 읽어, 카테고리를 이름으로 저장한 예전 형식인지 본다.
+
+    파일 전체를 읽지 않으므로 어떤 명령에서든 부담 없이 확인할 수 있다.
+    (JSONL 한 파일 안의 줄들은 같은 형식이므로 첫 줄만 보면 충분하다.)
+    """
+    for line in _iter_lines(path):
+        data = json.loads(line)
+        return "category_id" not in data and "category" in data
+    return False  # 파일이 없거나 비어 있으면 옮길 것도 없다
 
 
 def _atomic_write_lines(path: str, lines: Iterable[str], encoding: str = "utf-8") -> None:
@@ -178,39 +191,93 @@ class TransactionRepository:
         """
         return f"TX-{self.max_id_num() + 1:06d}"
 
+    def uses_legacy_category_key(self) -> bool:
+        """카테고리를 이름으로 저장한 예전 파일인지 확인한다."""
+        return _uses_legacy_category_key(self.path)
+
 
 # --------------------------------------------------------------------------- #
 # 카테고리 저장소
 # --------------------------------------------------------------------------- #
 class CategoryStore:
-    """categories.jsonl 을 다루는 저장소."""
+    """categories.jsonl 을 다루는 저장소.
 
-    # 기본 카테고리 목록
+    한 줄 예시: ``{"id": "CAT-000001", "name": "food"}``
+
+    ``id`` 가 PK(유일 식별자)이고, ``name`` 은 PK 가 아니지만
+    사람이 직접 입력하는 값이라 중복 등록만 막는다(유일 값).
+    """
+
+    # 기본 카테고리 목록 (이름만 적어 두고, id 는 만들 때 자동으로 붙인다)
     DEFAULTS: list[str] = ["food", "transport", "rent", "salary", "etc"]
 
     def __init__(self, path: str) -> None:
         self.path = path
 
-    def list(self) -> list[str]:
-        """카테고리 이름을 리스트로 반환.
+    def list_all(self) -> list[Category]:
+        """카테고리 전체를 ``Category`` 객체 리스트로 반환 (id 포함).
         """
-        return [json.loads(line)["name"] for line in _iter_lines(self.path)]
+        rows = [json.loads(line) for line in _iter_lines(self.path)]
+        # id 컬럼이 없던 예전 저장 파일도 그대로 열 수 있도록,
+        # 빠진 id 를 채워 넣고 파일을 한 번만 다시 쓴다.
+        if any(not _C_ID_RE.match(str(row.get("id", ""))) for row in rows):
+            rows = self._fill_missing_ids(rows)
+        return [Category.from_dict(row) for row in rows]
+
+    def list(self) -> list[str]:
+        """카테고리 이름만 리스트로 반환 (화면 출력/검증 메시지용).
+        """
+        return [c.name for c in self.list_all()]
 
     def exists(self, name: str) -> bool:
         """해당 카테고리명이 등록되어 있는지 확인. (거래를 추가하기 전에 꼭 확인한다)"""
         return name in self.list()
 
-    def add(self, name: str) -> None:
-        """카테고리 하나를 파일에 추가"""
+    def get_by_name(self, name: str) -> Optional[Category]:
+        """이름으로 카테고리 한 건을 찾는다. 없으면 None."""
+        for category in self.list_all():
+            if category.name == name:
+                return category
+        return None
+
+    def get(self, category_id: str) -> Optional[Category]:
+        """PK(id)로 카테고리 한 건을 찾는다. 없으면 None."""
+        for category in self.list_all():
+            if category.id == category_id:
+                return category
+        return None
+
+    def find(self, value: str) -> Optional[Category]:
+        """id 또는 이름으로 카테고리를 찾는다. 없으면 None.
+
+        사람은 ``food`` 라고 치고 스크립트는 ``CAT-000001`` 을 넘길 수 있으므로
+        둘 다 받아 준다. 같은 글자가 양쪽에 있으면 id 를 먼저 본다.
+        """
+        value = (value or "").strip()
+        if not value:
+            return None
+        categories = self.list_all()  # 파일은 한 번만 읽는다
+        for category in categories:
+            if category.id == value:
+                return category
+        for category in categories:
+            if category.name == value:
+                return category
+        return None
+
+    def add(self, name: str) -> Category:
+        """카테고리 하나를 파일에 추가하고, 새로 만든 객체를 돌려준다."""
+        category = Category(id=self.next_id(), name=name)
         os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
         with open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"name": name}, ensure_ascii=False) + "\n")
+            f.write(json.dumps(category.to_dict(), ensure_ascii=False) + "\n")
+        return category
 
-    def replace_all(self, names: list[str]) -> None:
+    def replace_all(self, categories: Iterable[Category]) -> None:
         """카테고리 목록 전체를 새 목록으로 교체한다 (삭제할 때 사용)."""
         _atomic_write_lines(
             self.path,
-            (json.dumps({"name": n}, ensure_ascii=False) for n in names),
+            (json.dumps(c.to_dict(), ensure_ascii=False) for c in categories),
         )
 
     def ensure_defaults(self) -> None:
@@ -219,8 +286,48 @@ class CategoryStore:
         프로그램을 처음 켰을 때 카테고리가 하나도 없으면
         거래를 단 한 건도 추가할 수 없다(카테고리는 필수).
         """
-        if not os.path.exists(self.path) or not self.list():
-            self.replace_all(self.DEFAULTS)
+        if not os.path.exists(self.path) or not self.list_all():
+            self.replace_all(
+                # enumerate(..., start=1) : 1번부터 번호를 붙여 가며 돌린다
+                Category(id=f"CAT-{num:06d}", name=name)
+                for num, name in enumerate(self.DEFAULTS, start=1)
+            )
+
+    def max_id_num(self) -> int:
+        """지금까지 쓰인 카테고리 id 중 가장 큰 번호 (CAT-000003 -> 3)."""
+        max_num = 0
+        for category in self.list_all():
+            m = _C_ID_RE.match(category.id)
+            if m:
+                max_num = max(max_num, int(m.group(1)))
+        return max_num
+
+    def next_id(self) -> str:
+        """다음에 쓸 카테고리 id (거래는 TX-, 규칙은 R-, 카테고리는 CAT-)."""
+        return f"CAT-{self.max_id_num() + 1:06d}"
+
+    def _fill_missing_ids(self, rows: list[dict]) -> list[dict]:
+        """id 가 없는 줄에 id 를 붙여 주고 파일을 다시 쓴다 (예전 파일 호환용).
+
+        앞에 ``_`` 가 붙은 이름은 "이 클래스 안에서만 쓰는 함수"라는 표시다.
+        """
+        max_num = 0
+        for row in rows:
+            m = _C_ID_RE.match(str(row.get("id", "")))
+            if m:
+                max_num = max(max_num, int(m.group(1)))
+        filled: list[dict] = []
+        for row in rows:
+            category_id = str(row.get("id", ""))
+            if not _C_ID_RE.match(category_id):
+                max_num += 1
+                category_id = f"CAT-{max_num:06d}"
+            filled.append({"id": category_id, "name": str(row["name"])})
+        _atomic_write_lines(
+            self.path,
+            (json.dumps(row, ensure_ascii=False) for row in filled),
+        )
+        return filled
 
 
 # --------------------------------------------------------------------------- #
@@ -308,3 +415,7 @@ class RecurringStore:
     def next_id(self) -> str:
         """다음에 쓸 규칙 id (거래는 TX-, 규칙은 R- 로 구분한다)."""
         return f"R-{self.max_id_num() + 1:06d}"
+
+    def uses_legacy_category_key(self) -> bool:
+        """카테고리를 이름으로 저장한 예전 파일인지 확인한다."""
+        return _uses_legacy_category_key(self.path)
